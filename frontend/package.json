@@ -1,0 +1,16 @@
+{
+  "name": "calendar-frontend",
+  "version": "1.0.0",
+  "description": "Calendar auto-scheduling frontend",
+  "main": "index.js",
+  "scripts": {
+    "dev": "echo 'Frontend dev server - to be configured'",
+    "build": "echo 'Frontend build - to be configured'"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {},
+  "devDependencies": {}
+}
+
