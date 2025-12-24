@@ -49,7 +49,8 @@ class Task:
     
     def __init__(self, id: str, title: str, deadline: str, total_duration: int,
                  chunking: bool = False, chunking_max_duration: Optional[int] = None,
-                 chunking_min_duration: Optional[int] = None, priority: int = 3):
+                 chunking_min_duration: Optional[int] = None, priority: int = 3,
+                 completed: bool = False):
         self.id = id
         self.title = title
         self.deadline = deadline
@@ -58,6 +59,7 @@ class Task:
         self.chunking_max_duration = chunking_max_duration  # in minutes
         self.chunking_min_duration = chunking_min_duration  # in minutes
         self.priority = priority  # 1-5, where 1 is highest priority
+        self.completed = completed  # Whether the task is completed
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert task to dictionary"""
@@ -69,7 +71,8 @@ class Task:
             'chunking': self.chunking,
             'chunking_max_duration': self.chunking_max_duration,
             'chunking_min_duration': self.chunking_min_duration,
-            'priority': self.priority
+            'priority': self.priority,
+            'completed': self.completed
         }
     
     @classmethod
@@ -83,7 +86,8 @@ class Task:
             chunking=data.get('chunking', False),
             chunking_max_duration=data.get('chunking_max_duration'),
             chunking_min_duration=data.get('chunking_min_duration'),
-            priority=data.get('priority', 3)
+            priority=data.get('priority', 3),
+            completed=data.get('completed', False)
         )
 
 # In-memory storage (replace with database in production)

@@ -28,22 +28,30 @@ class TaskScheduler:
         tasks = list(tasks_store.values())
         existing_events = list(events_store.values())
         
-        if not tasks:
+        # Filter out completed tasks
+        incomplete_tasks = [task for task in tasks if not task.completed]
+        
+        if not incomplete_tasks:
             return {
                 'status': 'success',
-                'message': 'No tasks to schedule',
+                'message': 'No incomplete tasks to schedule',
                 'scheduled_events': []
             }
         
         # Sort tasks according to priority rules
-        sorted_tasks = self._sort_tasks(tasks)
+        sorted_tasks = self._sort_tasks(incomplete_tasks)
         
         # Get existing events that are NOT task-related (to avoid clashes)
         # We'll track task events separately
         non_task_events = [e for e in existing_events if not getattr(e, 'task_id', None)]
         
-        # Delete old task-related events (we'll reschedule everything)
-        task_event_ids = [e.id for e in existing_events if getattr(e, 'task_id', None)]
+        # Delete old task-related events ONLY for incomplete tasks (we'll reschedule them)
+        # Keep events for completed tasks (they show what was scheduled in the past)
+        incomplete_task_ids = {task.id for task in incomplete_tasks}
+        task_event_ids = [
+            e.id for e in existing_events 
+            if getattr(e, 'task_id', None) and getattr(e, 'task_id', None) in incomplete_task_ids
+        ]
         for event_id in task_event_ids:
             if event_id in events_store:
                 del events_store[event_id]
@@ -67,40 +75,60 @@ class TaskScheduler:
             'status': 'success' if not errors else 'partial',
             'scheduled_events': [e.to_dict() for e in scheduled_events],
             'errors': errors,
-            'total_tasks': len(tasks),
-            'successfully_scheduled': len(tasks) - len(errors)
+            'total_tasks': len(incomplete_tasks),
+            'successfully_scheduled': len(incomplete_tasks) - len(errors)
         }
     
     def _sort_tasks(self, tasks: List[Task]) -> List[Task]:
         """
         Sort tasks according to priority rules:
-        1. Meeting deadlines is most important
-        2. If deadline will be missed, prioritize higher priority deadlines
-        3. If both deadlines can be met, schedule earlier deadline first
-        4. If same deadline, schedule higher priority first
+        1. Tasks that can meet their deadlines (sorted by priority, then deadline)
+        2. Higher priority tasks with past deadlines (sorted by priority) - before lower priority tasks
+        3. Lower priority tasks with past deadlines (sorted by priority) - only if other tasks' deadlines can be met
+        4. Tasks that can't meet their deadlines but aren't past deadline (sorted by priority, then deadline)
         """
         now = datetime.now()
         
         def task_sort_key(task: Task) -> Tuple:
-            deadline = datetime.fromisoformat(task.deadline.replace('Z', '+00:00'))
+            deadline_str = task.deadline.replace('Z', '+00:00') if task.deadline.endswith('Z') else task.deadline
+            try:
+                deadline = datetime.fromisoformat(deadline_str)
+            except ValueError:
+                deadline = datetime.fromisoformat(task.deadline.replace('Z', ''))
+            
             if deadline.tzinfo:
                 deadline = deadline.replace(tzinfo=None)
+            
+            # Check if deadline has passed
+            deadline_passed = deadline < now
             
             # Calculate if deadline can be met (rough estimate)
             # We'll check this more precisely during scheduling
             time_until_deadline = (deadline - now).total_seconds() / 60  # minutes
             can_meet_deadline = time_until_deadline >= task.total_duration
             
-            # Sort key: (can_meet_deadline, priority, deadline)
-            # can_meet_deadline: False (0) comes before True (1) - prioritize tasks that can meet deadline
-            # priority: lower number = higher priority (1 is highest)
-            # deadline: earlier deadline comes first
+            # Sort key structure:
+            # Group 0: Tasks that can meet their deadlines (priority, deadline)
+            # Group 1: Higher priority tasks with past deadlines (priority) - these come before lower priority tasks
+            # Group 2: Lower priority tasks with past deadlines (priority) - only if other tasks can meet deadlines
+            # Group 3: Tasks that can't meet deadlines but aren't past deadline (priority, deadline)
             
-            return (
-                0 if can_meet_deadline else 1,  # Tasks that can meet deadline first
-                task.priority,  # Lower priority number = higher priority
-                deadline  # Earlier deadline first
-            )
+            if can_meet_deadline:
+                # Group 0: Can meet deadline - prioritize by priority, then deadline
+                return (0, task.priority, deadline)
+            elif deadline_passed:
+                # Past deadline tasks
+                # Higher priority (1-2) come before lower priority (3-5)
+                # Use priority as the key, with higher priority tasks (lower numbers) first
+                if task.priority <= 2:
+                    # Group 1: Higher priority past deadline - before lower priority tasks
+                    return (1, task.priority, deadline)
+                else:
+                    # Group 2: Lower priority past deadline - after tasks that can meet deadlines
+                    return (2, task.priority, deadline)
+            else:
+                # Group 3: Can't meet deadline but not past deadline yet
+                return (3, task.priority, deadline)
         
         return sorted(tasks, key=task_sort_key)
     
@@ -127,7 +155,10 @@ class TaskScheduler:
             deadline = deadline.replace(tzinfo=None)
         
         now = datetime.now()
-        start_date = now.date()
+        # Ensure we don't schedule before today
+        today = now.date()
+        # Always start from today (or deadline if deadline is in the future and we want to schedule before it)
+        start_date = today
         
         # If task has chunking enabled, split into chunks
         if task.chunking:
@@ -139,47 +170,58 @@ class TaskScheduler:
         remaining_chunks = list(enumerate(chunks))  # Store (index, duration) tuples
         total_chunks = len(chunks)
         
-        # Try to schedule all chunks before the deadline
+        # Start scheduling from today (or deadline if deadline is in the future)
         current_date = start_date
         
-        while remaining_chunks and current_date <= deadline.date():
-            # Get available time slots for this day
-            free_slots = self._get_free_slots(current_date, existing_events + scheduled_events)
-            
-            # Try to schedule chunks in available slots
-            chunks_to_remove = []
-            for chunk_idx, chunk_duration in remaining_chunks:
-                slot = self._find_suitable_slot(free_slots, chunk_duration, deadline)
-                if slot:
-                    # Create event for this chunk
-                    event = self._create_task_event(
-                        task,
-                        slot[0],
-                        slot[1],
-                        chunk_index=chunk_idx if total_chunks > 1 else None,
-                        total_chunks=total_chunks if total_chunks > 1 else None
-                    )
-                    scheduled_events.append(event)
-                    events_store[event.id] = event
-                    
-                    # Update free slots
-                    free_slots = self._remove_slot(free_slots, slot)
-                    chunks_to_remove.append((chunk_idx, chunk_duration))
-            
-            # Remove scheduled chunks
-            for chunk_tuple in chunks_to_remove:
-                remaining_chunks.remove(chunk_tuple)
-            
-            # Move to next day if we still have chunks
-            if remaining_chunks:
-                current_date += timedelta(days=1)
+        # Try to schedule all chunks before the deadline (if deadline is in the future)
+        # If deadline has passed, we'll schedule starting from today
+        deadline_date = deadline.date()
+        max_date = deadline_date if deadline_date >= today else None
+        
+        if max_date:
+            # Deadline is in the future, try to schedule before it
+            while remaining_chunks and current_date <= max_date:
+                # Get available time slots for this day
+                free_slots = self._get_free_slots(current_date, existing_events + scheduled_events)
+                
+                # Try to schedule chunks in available slots
+                chunks_to_remove = []
+                for chunk_idx, chunk_duration in remaining_chunks:
+                    slot = self._find_suitable_slot(free_slots, chunk_duration, deadline)
+                    if slot:
+                        # Create event for this chunk
+                        event = self._create_task_event(
+                            task,
+                            slot[0],
+                            slot[1],
+                            chunk_index=chunk_idx if total_chunks > 1 else None,
+                            total_chunks=total_chunks if total_chunks > 1 else None
+                        )
+                        scheduled_events.append(event)
+                        events_store[event.id] = event
+                        
+                        # Update free slots
+                        free_slots = self._remove_slot(free_slots, slot)
+                        chunks_to_remove.append((chunk_idx, chunk_duration))
+                
+                # Remove scheduled chunks
+                for chunk_tuple in chunks_to_remove:
+                    remaining_chunks.remove(chunk_tuple)
+                
+                # Move to next day if we still have chunks
+                if remaining_chunks:
+                    current_date += timedelta(days=1)
         
         # If we couldn't schedule all chunks, schedule what we can
-        # (This handles the case where deadline might be missed)
+        # (This handles the case where deadline might be missed or has passed)
         if remaining_chunks:
-            # Try to schedule remaining chunks even if past deadline
-            # This follows rule 2: prioritize higher priority deadlines even if missed
-            current_date = deadline.date() + timedelta(days=1)
+            # If deadline has passed, start from today
+            # Otherwise, start from the day after deadline
+            if deadline_date < today:
+                current_date = today
+            else:
+                current_date = deadline_date + timedelta(days=1)
+            
             max_future_days = 30  # Don't schedule too far in the future
             
             for _ in range(max_future_days):
@@ -239,6 +281,7 @@ class TaskScheduler:
     def _get_free_slots(self, date: datetime.date, existing_events: List[Event]) -> List[Tuple[datetime, datetime]]:
         """
         Get free time slots for a given date (9 AM - 5 PM)
+        Ensures nothing is scheduled before the present day/time
         
         Args:
             date: Date to get slots for
@@ -247,9 +290,16 @@ class TaskScheduler:
         Returns:
             List of (start, end) tuples for free slots
         """
+        now = datetime.now()
+        today = now.date()
+        
         # Start and end of work day
         day_start = datetime.combine(date, datetime.min.time().replace(hour=self.WORK_START_HOUR))
         day_end = datetime.combine(date, datetime.min.time().replace(hour=self.WORK_END_HOUR))
+        
+        # If this is today, don't schedule before the current time
+        if date == today:
+            day_start = max(day_start, now)
         
         # Get events for this day
         day_events = []

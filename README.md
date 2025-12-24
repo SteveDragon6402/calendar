@@ -28,9 +28,10 @@ Create a `.env` file in the backend directory with your API keys and configurati
 ```
 GOOGLE_CLIENT_ID=your_google_client_id_here
 GOOGLE_CLIENT_SECRET=your_google_client_secret_here
-GOOGLE_REDIRECT_URI=http://localhost:5000/api/google-calendar/callback
+GOOGLE_REDIRECT_URI=http://localhost:5002/api/google-calendar/callback
+OPENAI_API_KEY=your_openai_api_key_here
 FLASK_ENV=development
-PORT=5000
+PORT=5002
 ```
 
 ## Features
@@ -54,6 +55,8 @@ PORT=5000
   - Priority levels (1-5, where 1 is highest)
   - Visual task cards with overdue highlighting
   - Edit and delete tasks
+  - **Bulk Import**: Paste multiple tasks in structured format
+  - **AI Bulk Add**: Describe tasks in natural language, AI converts to structured format
 
 ## API Endpoints
 
@@ -77,6 +80,8 @@ PORT=5000
 - `POST /api/tasks` - Create a new task
 - `PUT /api/tasks/<id>` - Update an existing task
 - `DELETE /api/tasks/<id>` - Delete a task
+- `POST /api/tasks/bulk` - Create multiple tasks at once
+- `POST /api/tasks/ai-bulk-add` - Process natural language task description with AI
 
 ### Health
 - `GET /api/health` - Health check

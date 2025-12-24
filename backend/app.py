@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from models import Event, events_store, Task, tasks_store
 from google_calendar_service import GoogleCalendarService
 from scheduler import TaskScheduler
+import tempfile
 
 # Load environment variables
 load_dotenv()
@@ -433,7 +434,303 @@ def delete_task(task_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+@app.route('/api/tasks/<task_id>/toggle-complete', methods=['POST'])
+def toggle_task_complete(task_id):
+    """Toggle task completion status"""
+    try:
+        if task_id not in tasks_store:
+            return jsonify({'error': 'Task not found'}), 404
+        
+        task = tasks_store[task_id]
+        data = request.json or {}
+        reschedule = data.get('reschedule', False)
+        
+        task.completed = not task.completed
+        
+        # When marking as completed, keep the events (they show what was scheduled)
+        # When marking as not done, delete events so they can be rescheduled
+        if not task.completed:
+            # Task is being marked as incomplete - delete events so they can be rescheduled
+            events_to_delete = [
+                event_id for event_id, event in events_store.items()
+                if hasattr(event, 'task_id') and event.task_id == task_id
+            ]
+            for event_id in events_to_delete:
+                del events_store[event_id]
+        
+        tasks_store[task_id] = task
+        
+        result = {
+            'task': task.to_dict(),
+            'message': 'Task marked as completed' if task.completed else 'Task marked as incomplete'
+        }
+        
+        # If marking as not done and reschedule requested, trigger rescheduling
+        if not task.completed and reschedule:
+            from scheduler import TaskScheduler
+            scheduler = TaskScheduler()
+            schedule_result = scheduler.schedule_all_tasks()
+            result['rescheduled'] = True
+            result['schedule_result'] = schedule_result
+        
+        return jsonify(result)
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/tasks/check-past-due', methods=['POST'])
+def check_past_due_tasks():
+    """Check for past-due scheduled task events and mark tasks as completed"""
+    try:
+        now = datetime.now()
+        marked_complete = []
+        
+        # Find all task-related events that have passed
+        for event_id, event in events_store.items():
+            task_id = getattr(event, 'task_id', None)
+            if not task_id:
+                continue
+            
+            # Skip if task is already completed
+            if task_id not in tasks_store:
+                continue
+            
+            task = tasks_store[task_id]
+            if task.completed:
+                continue
+            
+            # Parse event end time
+            try:
+                end_str = event.end.replace('Z', '+00:00') if event.end.endswith('Z') else event.end
+                event_end = datetime.fromisoformat(end_str)
+                if event_end.tzinfo:
+                    event_end = event_end.replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                continue
+            
+            # If event end time has passed, mark task as completed
+            if event_end <= now:
+                task.completed = True
+                tasks_store[task_id] = task
+                marked_complete.append({
+                    'task_id': task_id,
+                    'task_title': task.title,
+                    'event_id': event_id,
+                    'event_end': event.end
+                })
+        
+        return jsonify({
+            'marked_complete': marked_complete,
+            'count': len(marked_complete)
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+
+@app.route('/api/tasks/bulk', methods=['POST'])
+def bulk_create_tasks():
+    """Create multiple tasks at once"""
+    try:
+        data = request.json
+        tasks_data = data.get('tasks', [])
+        
+        if not tasks_data:
+            return jsonify({'error': 'No tasks provided'}), 400
+        
+        created_tasks = []
+        errors = []
+        
+        for i, task_data in enumerate(tasks_data):
+            try:
+                # Validate required fields
+                if not task_data.get('title') or not task_data.get('deadline') or not task_data.get('total_duration'):
+                    errors.append(f"Task {i + 1}: Missing required fields")
+                    continue
+                
+                # Validate priority
+                priority = task_data.get('priority', 3)
+                if priority < 1 or priority > 5:
+                    errors.append(f"Task {i + 1}: Invalid priority (must be 1-5)")
+                    continue
+                
+                # Generate unique ID
+                task_id = str(uuid.uuid4())
+                
+                # Create task
+                task = Task(
+                    id=task_id,
+                    title=task_data['title'],
+                    deadline=task_data['deadline'],
+                    total_duration=int(task_data['total_duration']),
+                    chunking=task_data.get('chunking', False),
+                    chunking_max_duration=int(task_data['chunking_max_duration']) if task_data.get('chunking_max_duration') else None,
+                    chunking_min_duration=int(task_data['chunking_min_duration']) if task_data.get('chunking_min_duration') else None,
+                    priority=priority,
+                    completed=task_data.get('completed', False)
+                )
+                
+                tasks_store[task_id] = task
+                created_tasks.append(task.to_dict())
+            except Exception as e:
+                errors.append(f"Task {i + 1}: {str(e)}")
+        
+        return jsonify({
+            'created': len(created_tasks),
+            'total': len(tasks_data),
+            'errors': errors,
+            'tasks': created_tasks
+        }), 201
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
+@app.route('/api/tasks/ai-bulk-add', methods=['POST'])
+def ai_bulk_add_tasks():
+    """Process natural language task description with AI and convert to bulk import format"""
+    try:
+        from openai import OpenAI
+        
+        data = request.json
+        description = data.get('description', '').strip()
+        
+        if not description:
+            return jsonify({'error': 'No description provided'}), 400
+        
+        # Check for OpenAI API key
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            return jsonify({
+                'error': 'OpenAI API key not configured',
+                'message': 'Please set OPENAI_API_KEY environment variable'
+            }), 500
+        
+        # Initialize OpenAI client
+        client = OpenAI(api_key=api_key)
+        
+        # Create prompt for GPT
+        prompt = f"""You are a task management assistant. Convert the following natural language task description into a structured task list format.
+
+The output format should be one task per line, with each line following this exact format:
+Name: [Task Name]; Due: [MM/DD/YYYY]; Time: [minutes]; Chunk: [Yes/No]; ChunkMin: [minutes]; ChunkMax: [minutes]; Priority: [1-5]
+
+Rules:
+- Extract all tasks mentioned in the description
+- For dates: Use MM/DD/YYYY format. If no date is mentioned, use today's date ({datetime.now().strftime('%m/%d/%Y')})
+- For time: Convert hours to minutes (e.g., "4 hours" = 240 minutes, "1 hour" = 60 minutes, "30 minutes" = 30)
+- For chunking: Set to "Yes" if the user mentions breaking tasks into chunks or if the task is long (>2 hours). Otherwise "No"
+- For ChunkMin/ChunkMax: Only include if Chunk is "Yes". Use reasonable defaults (30-60 minutes) if not specified
+- For Priority: Use 1 (highest) for urgent/important tasks, 5 (lowest) for less important. Default to 3 if unclear
+- Only include fields that are specified or can be reasonably inferred
+- Output ONLY the formatted task lines, one per line, nothing else
+
+User description:
+{description}
+
+Formatted tasks:"""
+
+        # Call OpenAI API
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Using gpt-4o (latest available), user mentioned GPT 5.1 but that doesn't exist yet
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that converts natural language task descriptions into structured task formats."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=1000
+        )
+        
+        # Extract formatted tasks from response
+        formatted_tasks = response.choices[0].message.content.strip()
+        
+        # Count tasks (lines that start with "Name:")
+        task_count = len([line for line in formatted_tasks.split('\n') if line.strip().startswith('Name:')])
+        
+        return jsonify({
+            'formatted_tasks': formatted_tasks,
+            'task_count': task_count,
+            'raw_response': formatted_tasks
+        })
+        
+    except ImportError:
+        return jsonify({
+            'error': 'OpenAI library not installed',
+            'message': 'Please install openai: pip install openai'
+        }), 500
+    except Exception as e:
+        import traceback
+        print(f"Error in AI bulk add: {traceback.format_exc()}")
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+
 # Auto-scheduling endpoint
+
+@app.route('/api/tasks/transcribe', methods=['POST'])
+def transcribe_audio():
+    """Transcribe audio using Whisper API"""
+    try:
+        from openai import OpenAI
+        
+        # Check for audio file in request
+        if 'audio' not in request.files:
+            return jsonify({'error': 'No audio file provided'}), 400
+        
+        audio_file = request.files['audio']
+        if audio_file.filename == '':
+            return jsonify({'error': 'No audio file selected'}), 400
+        
+        # Check for OpenAI API key
+        api_key = os.environ.get('OPENAI_API_KEY')
+        if not api_key:
+            return jsonify({
+                'error': 'OpenAI API key not configured',
+                'message': 'Please set OPENAI_API_KEY environment variable'
+            }), 500
+        
+        # Initialize OpenAI client
+        client = OpenAI(api_key=api_key)
+        
+        # Save audio file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.webm') as tmp_file:
+            audio_file.save(tmp_file.name)
+            tmp_file_path = tmp_file.name
+        
+        try:
+            # Transcribe with Whisper
+            with open(tmp_file_path, 'rb') as audio:
+                transcript = client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio,
+                    language="en"
+                )
+            
+            transcription_text = transcript.text.strip()
+            
+            return jsonify({
+                'transcription': transcription_text,
+                'success': True
+            })
+        finally:
+            # Clean up temporary file
+            if os.path.exists(tmp_file_path):
+                os.unlink(tmp_file_path)
+        
+    except ImportError:
+        return jsonify({
+            'error': 'OpenAI library not installed',
+            'message': 'Please install openai: pip install openai'
+        }), 500
+    except Exception as e:
+        import traceback
+        print(f"Error in transcription: {traceback.format_exc()}")
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
 
 @app.route('/api/schedule', methods=['POST'])
 def auto_schedule():
